@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -29,8 +30,7 @@ func NewClient(t string) (*Client, error) {
 	c, _, err := websocket.DefaultDialer.Dial(u, nil)
 
 	if err != nil {
-		log.Println("Error creating websocket connection")
-		return &Client{}, err
+		return &Client{}, fmt.Errorf("error creating client websocket connection: %v", err)
 	}
 
 	client.conn = c
@@ -165,7 +165,7 @@ func (c *Client) reconnect() {
 	u, err := getWsURL()
 
 	if err != nil {
-		log.Printf("Could not get wsURL: %s\n", err)
+		log.Println(err)
 	}
 
 	conn, _, err := websocket.DefaultDialer.Dial(u, nil)
@@ -184,8 +184,7 @@ func getWsURL() (string, error) {
 	resp, err := http.Get("https://discordapp.com/api/gateway")
 
 	if err != nil {
-		log.Println("Error getting websocket url")
-		return "", err
+		return "", fmt.Errorf("error getting gateway websocket url: %v", err)
 	}
 
 	defer resp.Body.Close()
@@ -193,16 +192,14 @@ func getWsURL() (string, error) {
 	body, err := ioutil.ReadAll(resp.Body)
 
 	if err != nil {
-		log.Println("Error readying wsURL response")
-		return "", err
+		return "", fmt.Errorf("error readying wsURL response: %v", err)
 	}
 
 	var u wsURL
 	err = json.Unmarshal(body, &u)
 
 	if err != nil {
-		log.Println("Error parsing url")
-		return "", err
+		return "", fmt.Errorf("error parsing wsUrl: %v", err)
 	}
 
 	return u.URL, nil

@@ -16,13 +16,12 @@ import (
 func main() {
 	token, err := readToken()
 	if err != nil {
-		fmt.Println(err)
+		log.Fatal(err)
 	}
 
 	client, err := gateway.NewClient(token)
-
 	if err != nil {
-		fmt.Printf("couldn't create gateway client: %s", err)
+		log.Fatal(err)
 	}
 
 	client.EventHandlers[gateway.MessageCreateEvent] = func(data json.RawMessage) {
@@ -67,8 +66,7 @@ func main() {
 func readToken() (string, error) {
 	b, err := ioutil.ReadFile("go-bot-token.txt")
 	if err != nil {
-		fmt.Println("Error reading token file")
-		return "", err
+		return "", fmt.Errorf("error reading token file: %v", err)
 	}
 	return strings.TrimRight(string(b), "\n"), nil
 }
