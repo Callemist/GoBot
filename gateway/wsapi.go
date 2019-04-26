@@ -15,6 +15,18 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// Client handles communcation with Discords websocket api
+type Client struct {
+	token               string
+	wsMux               sync.Mutex
+	conn                *websocket.Conn
+	sequence            *int64
+	lastHeartbeatAck    time.Time
+	EventHandlers       map[string]func(json.RawMessage)
+	SessionInfo         events.ReadyEvent
+	VoiceUpdateResponse chan interface{}
+}
+
 // NewClient returns a client to subscribe on Discord events
 // sent via the gateway.
 func NewClient(t string) (*Client, error) {
@@ -22,6 +34,7 @@ func NewClient(t string) (*Client, error) {
 	client.token = t
 	client.sequence = new(int64)
 	client.EventHandlers = make(map[string]func(json.RawMessage))
+	client.VoiceUpdateResponse = make(chan interface{}, 2)
 
 	u, err := getWsURL()
 
@@ -63,6 +76,7 @@ func (c *Client) Start() {
 			log.Printf("Invalid json: %s\n", err)
 		}
 
+		// Hello event
 		if p.Operation == 10 {
 			var he helloEvent
 			err := json.Unmarshal(p.EventData, &he)
@@ -77,6 +91,7 @@ func (c *Client) Start() {
 			go c.startHeartbeat(he.HeartBeatInterval, stopc)
 		}
 
+		// Heartbeat ACK event
 		if p.Operation == 11 {
 			c.lastHeartbeatAck = time.Now().UTC()
 			log.Println("Received ACK")
@@ -91,6 +106,17 @@ func (c *Client) Start() {
 			if err != nil {
 				log.Printf("Error sending heartbeat on request of gateway: %s", err)
 			}
+		}
+
+		// Voice Server Update event
+		if p.Operation == 4 {
+			var vsu events.VoiceStateUpdateEvent
+			err := json.Unmarshal(p.EventData, &vsu)
+			if err != nil {
+				log.Println("error parsing VoiceStateUpdate response:", err)
+			}
+
+			c.VoiceUpdateResponse <- vsu
 		}
 
 		if p.Operation == 0 {
@@ -194,8 +220,15 @@ func (c *Client) reconnect() {
 // RequestVoice sends a VoiceStateUpdate to the Discord voice server to
 // let it know that we want to connect, Discord should responed with
 // a VOICE_SERVER_UPDATE event and a VOICE_STATE_UPDATE event
-func (c *Client) RequestVoice(voiceState events.VoiceStateUpdateEvent) {
+func (c *Client) RequestVoice(channelID string) {
 	c.wsMux.Lock()
+
+	voiceState := events.VoiceStateUpdateEvent{
+		GuildID:   c.SessionInfo.UnavailableGuildes[0].ChannelID,
+		ChannelID: channelID,
+		SelfMute:  false,
+		SelfDeaf:  false}
+
 	jsonData, err := json.Marshal(voiceState)
 
 	if err != nil {
@@ -237,17 +270,6 @@ func getWsURL() (string, error) {
 	}
 
 	return u.URL, nil
-}
-
-// Client handles communcation with Discords websocket api
-type Client struct {
-	token            string
-	wsMux            sync.Mutex
-	conn             *websocket.Conn
-	sequence         *int64
-	lastHeartbeatAck time.Time
-	EventHandlers    map[string]func(json.RawMessage)
-	SessionInfo      events.ReadyEvent
 }
 
 type wsURL struct {

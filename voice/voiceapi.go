@@ -17,5 +17,5 @@ func NewClient(g *gateway.Client) *Client {
 }
 
 func (c *Client) EstablishConnection(channelID string) {
-	//c.RequestVoice()
+	c.gateway.RequestVoice(channelID)
 }
