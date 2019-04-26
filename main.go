@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"go-bot/events"
 	"go-bot/gateway"
 	"io/ioutil"
 	"log"
@@ -24,8 +25,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	client.EventHandlers[gateway.MessageCreateEvent] = func(data json.RawMessage) {
-		var message gateway.MessageEvent
+	client.EventHandlers[events.MessageCreate] = func(data json.RawMessage) {
+		var message events.MessageEvent
 		err := json.Unmarshal(data, &message)
 
 		if err != nil {

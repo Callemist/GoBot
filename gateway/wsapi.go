@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"go-bot/events"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -105,6 +107,15 @@ func (c *Client) Start() {
 }
 
 func (c *Client) handleEvent(p payload) {
+	if p.Type == events.Ready {
+		var r events.ReadyEvent
+		err := json.Unmarshal(p.EventData, &r)
+		if err != nil {
+			log.Fatal("could not unmarshal readyEvent:", err)
+		}
+		c.SessionInfo = r
+	}
+
 	if _, ok := c.EventHandlers[p.Type]; ok {
 		c.EventHandlers[p.Type](p.EventData)
 	}
@@ -180,6 +191,29 @@ func (c *Client) reconnect() {
 	go c.Start()
 }
 
+// RequestVoice sends a VoiceStateUpdate to the Discord voice server to
+// let it know that we want to connect, Discord should responed with
+// a VOICE_SERVER_UPDATE event and a VOICE_STATE_UPDATE event
+func (c *Client) RequestVoice(voiceState events.VoiceStateUpdateEvent) {
+	c.wsMux.Lock()
+	jsonData, err := json.Marshal(voiceState)
+
+	if err != nil {
+		log.Println("error parsing voice state data:", err)
+	}
+
+	p := payload{}
+	p.Operation = 4
+	p.EventData = jsonData
+
+	c.conn.WriteJSON(p)
+	c.wsMux.Unlock()
+
+	if err != nil {
+		log.Println("error requesting voice connection:", err)
+	}
+}
+
 func getWsURL() (string, error) {
 	resp, err := http.Get("https://discordapp.com/api/gateway")
 
@@ -203,4 +237,54 @@ func getWsURL() (string, error) {
 	}
 
 	return u.URL, nil
+}
+
+// Client handles communcation with Discords websocket api
+type Client struct {
+	token            string
+	wsMux            sync.Mutex
+	conn             *websocket.Conn
+	sequence         *int64
+	lastHeartbeatAck time.Time
+	EventHandlers    map[string]func(json.RawMessage)
+	SessionInfo      events.ReadyEvent
+}
+
+type wsURL struct {
+	URL string `json:"url"`
+}
+
+// heartbeat Opcode 1
+type heartbeatOp struct {
+	Op   int   `json:"op"`
+	Data int64 `json:"d"`
+}
+
+// IdentifyEvent Opcode 2
+type identifyEvent struct {
+	Token string     `json:"token"`
+	Specs properties `json:"properties"`
+}
+
+// Properties contains specs that are needed for
+// identification
+type properties struct {
+	OS      string `json:"os"`
+	Browser string `json:"browser"`
+	Device  string `json:"device"`
+}
+
+// Payload is a wrapper for messages received by
+// the Discord gateway
+type payload struct {
+	Operation int             `json:"op"`
+	EventData json.RawMessage `json:"d"`
+	Sequence  int64           `json:"s"`
+	Type      string          `json:"t"`
+}
+
+// HelloEvent Opcode 10
+type helloEvent struct {
+	HeartBeatInterval int      `json:"heartbeat_interval"`
+	Trace             []string `json:"_trace"`
 }
