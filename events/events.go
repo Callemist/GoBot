@@ -36,9 +36,36 @@ type VoiceStateUpdateEvent struct {
 	SelfDeaf  bool   `json:"self_deaf"`
 }
 
+type VoiceStateUpdateResponseEvent struct {
+	MemberInfo Member `json:"member"`
+	UserID     string `json:"user_id"`
+	Suppress   bool   `json:"suppress"`
+	SessionID  string `json:"session_id"`
+	SelfMute   bool   `json:"self_mute"`
+	SelfDeaf   bool   `json:"self_deaf"`
+	Mute       bool   `json:"mute"`
+	GuildID    string `json:"guild_id"`
+	Deaf       bool   `json:"deaf"`
+	ChannelID  string `json:"channel_id"`
+}
+
+type VoiceServerUpdateEvent struct {
+	Token    string `json:"token"`
+	GuildID  string `json:"guild_id"`
+	Endpoint string `json:"endpoint"`
+}
+
+type Member struct {
+	UserInfo User      `json:"user"`
+	Roles    []string  `json:"roles"`
+	Mute     bool      `json:"mute"`
+	JoinedAt time.Time `json:"joined_at"`
+	Deaf     bool      `json:"deaf"`
+}
+
 type UnavailableGuilde struct {
-	Enabled   bool   `json:"enabled"`
-	ChannelID string `json:"channel_id"`
+	Unavailable bool   `json:"unavailable"`
+	GuildID     string `json:"id"`
 }
 
 type User struct {

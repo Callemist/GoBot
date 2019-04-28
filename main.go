@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"go-bot/events"
 	"go-bot/gateway"
+	"go-bot/voice"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -20,12 +21,14 @@ func main() {
 		log.Fatal(err)
 	}
 
-	client, err := gateway.NewClient(token)
+	wsClient, err := gateway.NewClient(token)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	client.EventHandlers[events.MessageCreate] = func(data json.RawMessage) {
+	voiceClient := voice.NewClient(wsClient)
+
+	wsClient.EventHandlers[events.MessageCreate] = func(data json.RawMessage) {
 		var message events.MessageEvent
 		err := json.Unmarshal(data, &message)
 
@@ -39,9 +42,9 @@ func main() {
 
 		url := "https://discordapp.com/api/v6/channels/" + message.ChannelID + "/messages"
 
-		log.Println("got this far")
+		go voiceClient.EstablishConnection("voice channel id")
 
-		var jsonStr = []byte(`{"content":":ok_hand: YEET :ok_hand:", "tts": false}`)
+		var jsonStr = []byte(`{"content":"Establishing voice", "tts": false}`)
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonStr))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bot "+token)
@@ -59,7 +62,7 @@ func main() {
 
 	}
 
-	go client.Start()
+	go wsClient.Start()
 
 	bufio.NewReader(os.Stdin).ReadBytes('\n')
 }

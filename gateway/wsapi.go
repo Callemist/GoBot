@@ -24,7 +24,7 @@ type Client struct {
 	lastHeartbeatAck    time.Time
 	EventHandlers       map[string]func(json.RawMessage)
 	SessionInfo         events.ReadyEvent
-	VoiceUpdateResponse chan interface{}
+	VoiceUpdateResponse chan Payload
 }
 
 // NewClient returns a client to subscribe on Discord events
@@ -34,7 +34,7 @@ func NewClient(t string) (*Client, error) {
 	client.token = t
 	client.sequence = new(int64)
 	client.EventHandlers = make(map[string]func(json.RawMessage))
-	client.VoiceUpdateResponse = make(chan interface{}, 2)
+	client.VoiceUpdateResponse = make(chan Payload)
 
 	u, err := getWsURL()
 
@@ -67,9 +67,9 @@ func (c *Client) Start() {
 		var pretty bytes.Buffer
 		json.Indent(&pretty, message, "", "    ")
 
-		log.Printf("received:\n%s\n", string(pretty.Bytes()))
+		//log.Printf("received:\n%s\n", string(pretty.Bytes()))
 
-		var p payload
+		var p Payload
 		err = json.Unmarshal(message, &p)
 
 		if err != nil {
@@ -108,17 +108,6 @@ func (c *Client) Start() {
 			}
 		}
 
-		// Voice Server Update event
-		if p.Operation == 4 {
-			var vsu events.VoiceStateUpdateEvent
-			err := json.Unmarshal(p.EventData, &vsu)
-			if err != nil {
-				log.Println("error parsing VoiceStateUpdate response:", err)
-			}
-
-			c.VoiceUpdateResponse <- vsu
-		}
-
 		if p.Operation == 0 {
 			atomic.StoreInt64(c.sequence, p.Sequence)
 			c.handleEvent(p)
@@ -132,14 +121,19 @@ func (c *Client) Start() {
 	}
 }
 
-func (c *Client) handleEvent(p payload) {
+func (c *Client) handleEvent(p Payload) {
+	log.Println(p.Type)
 	if p.Type == events.Ready {
 		var r events.ReadyEvent
 		err := json.Unmarshal(p.EventData, &r)
 		if err != nil {
-			log.Fatal("could not unmarshal readyEvent:", err)
+			log.Println("could not unmarshal readyEvent:", err)
 		}
 		c.SessionInfo = r
+	}
+
+	if p.Type == events.VoiceStateUpdate || p.Type == events.VoiceServerUpdate {
+		c.VoiceUpdateResponse <- p
 	}
 
 	if _, ok := c.EventHandlers[p.Type]; ok {
@@ -156,7 +150,7 @@ func (c *Client) identify() error {
 		return err
 	}
 
-	ideResponse := payload{}
+	ideResponse := Payload{}
 	ideResponse.Operation = 2
 	ideResponse.EventData = ide
 
@@ -221,10 +215,8 @@ func (c *Client) reconnect() {
 // let it know that we want to connect, Discord should responed with
 // a VOICE_SERVER_UPDATE event and a VOICE_STATE_UPDATE event
 func (c *Client) RequestVoice(channelID string) {
-	c.wsMux.Lock()
-
 	voiceState := events.VoiceStateUpdateEvent{
-		GuildID:   c.SessionInfo.UnavailableGuildes[0].ChannelID,
+		GuildID:   c.SessionInfo.UnavailableGuildes[0].GuildID,
 		ChannelID: channelID,
 		SelfMute:  false,
 		SelfDeaf:  false}
@@ -235,12 +227,15 @@ func (c *Client) RequestVoice(channelID string) {
 		log.Println("error parsing voice state data:", err)
 	}
 
-	p := payload{}
+	p := Payload{}
 	p.Operation = 4
 	p.EventData = jsonData
 
+	c.wsMux.Lock()
 	c.conn.WriteJSON(p)
 	c.wsMux.Unlock()
+
+	log.Println("voice request sent")
 
 	if err != nil {
 		log.Println("error requesting voice connection:", err)
@@ -298,7 +293,7 @@ type properties struct {
 
 // Payload is a wrapper for messages received by
 // the Discord gateway
-type payload struct {
+type Payload struct {
 	Operation int             `json:"op"`
 	EventData json.RawMessage `json:"d"`
 	Sequence  int64           `json:"s"`
