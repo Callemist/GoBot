@@ -1,6 +1,18 @@
 package events
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
+
+// Payload is a wrapper for messages received by
+// the Discord gateway
+type Payload struct {
+	Operation int             `json:"op"`
+	EventData json.RawMessage `json:"d"`
+	Sequence  int64           `json:"s"`
+	Type      string          `json:"t"`
+}
 
 type ReadyEvent struct {
 	Version            int                 `json:"v"`

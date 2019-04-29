@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"go-bot/events"
@@ -24,7 +23,7 @@ type Client struct {
 	lastHeartbeatAck    time.Time
 	EventHandlers       map[string]func(json.RawMessage)
 	SessionInfo         events.ReadyEvent
-	VoiceUpdateResponse chan Payload
+	VoiceUpdateResponse chan events.Payload
 }
 
 // NewClient returns a client to subscribe on Discord events
@@ -34,7 +33,7 @@ func NewClient(t string) (*Client, error) {
 	client.token = t
 	client.sequence = new(int64)
 	client.EventHandlers = make(map[string]func(json.RawMessage))
-	client.VoiceUpdateResponse = make(chan Payload)
+	client.VoiceUpdateResponse = make(chan events.Payload)
 
 	u, err := getWsURL()
 
@@ -64,12 +63,11 @@ func (c *Client) Start() {
 			log.Printf("Error reading message: %s\n", err)
 		}
 
-		var pretty bytes.Buffer
-		json.Indent(&pretty, message, "", "    ")
+		// var pretty bytes.Buffer
+		// json.Indent(&pretty, message, "", "    ")
+		// log.Printf("received:\n%s\n", string(pretty.Bytes()))
 
-		//log.Printf("received:\n%s\n", string(pretty.Bytes()))
-
-		var p Payload
+		var p events.Payload
 		err = json.Unmarshal(message, &p)
 
 		if err != nil {
@@ -87,8 +85,8 @@ func (c *Client) Start() {
 
 			c.identify()
 
-			interval = he.HeartBeatInterval
-			go c.startHeartbeat(he.HeartBeatInterval, stopc)
+			interval = he.HeartbeatInterval
+			go c.startHeartbeat(he.HeartbeatInterval, stopc)
 		}
 
 		// Heartbeat ACK event
@@ -121,8 +119,8 @@ func (c *Client) Start() {
 	}
 }
 
-func (c *Client) handleEvent(p Payload) {
-	log.Println(p.Type)
+func (c *Client) handleEvent(p events.Payload) {
+	//log.Println(p.Type)
 	if p.Type == events.Ready {
 		var r events.ReadyEvent
 		err := json.Unmarshal(p.EventData, &r)
@@ -150,7 +148,7 @@ func (c *Client) identify() error {
 		return err
 	}
 
-	ideResponse := Payload{}
+	ideResponse := events.Payload{}
 	ideResponse.Operation = 2
 	ideResponse.EventData = ide
 
@@ -227,7 +225,7 @@ func (c *Client) RequestVoice(channelID string) {
 		log.Println("error parsing voice state data:", err)
 	}
 
-	p := Payload{}
+	p := events.Payload{}
 	p.Operation = 4
 	p.EventData = jsonData
 
@@ -291,17 +289,8 @@ type properties struct {
 	Device  string `json:"device"`
 }
 
-// Payload is a wrapper for messages received by
-// the Discord gateway
-type Payload struct {
-	Operation int             `json:"op"`
-	EventData json.RawMessage `json:"d"`
-	Sequence  int64           `json:"s"`
-	Type      string          `json:"t"`
-}
-
 // HelloEvent Opcode 10
 type helloEvent struct {
-	HeartBeatInterval int      `json:"heartbeat_interval"`
+	HeartbeatInterval int      `json:"heartbeat_interval"`
 	Trace             []string `json:"_trace"`
 }
