@@ -97,6 +97,12 @@ func (c *Client) Start() {
 			log.Println("Received ACK")
 		}
 
+		if time.Now().UTC().Sub(c.lastHeartbeatAck) > time.Millisecond*time.Duration(interval) {
+			stopc <- 0
+			c.reconnect()
+			return
+		}
+
 		// Opcode 1 is a heartbeat request from the Discord gateway
 		if p.Operation == 1 {
 			c.wsMux.Lock()
@@ -111,12 +117,6 @@ func (c *Client) Start() {
 		if p.Operation == 0 {
 			atomic.StoreInt64(c.sequence, p.Sequence)
 			c.handleEvent(p)
-		}
-
-		if time.Now().UTC().Sub(c.lastHeartbeatAck) > time.Millisecond*time.Duration(interval*2) {
-			stopc <- 0
-			c.reconnect()
-			return
 		}
 	}
 }
