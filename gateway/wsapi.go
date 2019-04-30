@@ -33,7 +33,7 @@ func NewClient(t string) (*Client, error) {
 	client.token = t
 	client.sequence = new(int64)
 	client.EventHandlers = make(map[string]func(json.RawMessage))
-	client.VoiceUpdateResponse = make(chan events.Payload)
+	client.VoiceUpdateResponse = make(chan events.Payload, 2)
 
 	u, err := getWsURL()
 
@@ -120,7 +120,7 @@ func (c *Client) Start() {
 }
 
 func (c *Client) handleEvent(p events.Payload) {
-	//log.Println(p.Type)
+	log.Println(p.Type)
 	if p.Type == events.Ready {
 		var r events.ReadyEvent
 		err := json.Unmarshal(p.EventData, &r)
@@ -188,7 +188,7 @@ func (c *Client) startHeartbeat(interval int, stop chan int) {
 }
 
 func (c *Client) reconnect() {
-	log.Println("Reconnecting")
+	log.Println("Reconnecting to gateway")
 	c.wsMux.Lock()
 	c.conn.Close()
 	u, err := getWsURL()

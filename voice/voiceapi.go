@@ -2,11 +2,13 @@ package voice
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"go-bot/events"
 	"go-bot/gateway"
 	"log"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -94,14 +96,17 @@ func (c *Client) start() {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
 			log.Println(fmt.Errorf("error reading message: %v", err))
-			log.Println("trying to re-establish connection")
+			// This might cause problems so add back later
+
+			// log.Println("trying to re-establish connection")
+
+			// stopc <- 0
+			// c.wsMux.Lock()
+			// c.conn.Close()
+			// c.wsMux.Unlock()
+			// c.EstablishConnection(c.currentChannelID)
 
 			stopc <- 0
-			c.wsMux.Lock()
-			c.conn.Close()
-			c.wsMux.Unlock()
-			c.EstablishConnection(c.currentChannelID)
-
 			return
 		}
 
@@ -127,6 +132,10 @@ func (c *Client) start() {
 			}
 
 			c.UDPInfo = ready
+			err = c.establishUDPConnection(ready)
+			if err != nil {
+				log.Println(err)
+			}
 		}
 
 		if p.Operation == 8 {
@@ -153,6 +162,65 @@ func (c *Client) start() {
 			return
 		}
 	}
+}
+
+func (c *Client) establishUDPConnection(UDPInfo voiceReadyEvent) error {
+	log.Println("establishing UDP voice connection")
+	addr := fmt.Sprintf("%s:%d", UDPInfo.IP, UDPInfo.Port)
+	log.Println(addr)
+
+	// addr, err := net.ResolveUDPAddr("udp", UDPInfo.IP+":"+string(UDPInfo.Port))
+	// if err != nil {
+	// 	return fmt.Errorf("error creating UDP address: %v", err)
+	// }
+
+	UDPConn, err := net.Dial("udp", addr)
+	if err != nil {
+		return fmt.Errorf("error establishing UDP connection: %v", err)
+	}
+	defer UDPConn.Close()
+
+	sendBuffer := make([]byte, 70)
+	binary.BigEndian.PutUint32(sendBuffer, UDPInfo.SSRC)
+	_, err = UDPConn.Write(sendBuffer)
+	if err != nil {
+		return fmt.Errorf("error starting IP discovery: %v", err)
+	}
+
+	readBuffer := make([]byte, 70)
+	_, err = UDPConn.Read(readBuffer)
+	if err != nil {
+		return fmt.Errorf("error reading UDP response: %v", err)
+	}
+
+	var ip string
+	for i := 4; i < 20; i++ {
+		if readBuffer[i] == 0 {
+			break
+		}
+		ip += string(readBuffer[i])
+	}
+
+	port := binary.LittleEndian.Uint16(readBuffer[68:70])
+
+	jsonData, err := json.Marshal(communicationInfo{"udp", data{ip, port, "xsalsa20_poly1305"}})
+	if err != nil {
+		return fmt.Errorf("error parsing communicationInfo: %v", err)
+	}
+
+	p := events.Payload{}
+	p.Operation = 1
+	p.EventData = jsonData
+
+	c.wsMux.Lock()
+	err = c.conn.WriteJSON(p)
+	c.wsMux.Unlock()
+
+	if err != nil {
+		return fmt.Errorf("error sending UDP communcation info: %v", err)
+	}
+
+	return nil
 }
 
 func (c *Client) reconnect() {
@@ -244,6 +312,17 @@ func logIfError(text string, err error) {
 	}
 }
 
+type communicationInfo struct {
+	Protocol string `json:"protocol"`
+	Data     data   `json:"data"`
+}
+
+type data struct {
+	Address    string `json:"address"`
+	Port       uint16 `json:"port"`
+	Encryption string `json:"mode"`
+}
+
 type identification struct {
 	ServerID  string `json:"server_id"`
 	UserID    string `json:"user_id"`
@@ -252,7 +331,7 @@ type identification struct {
 }
 
 type voiceReadyEvent struct {
-	SSRC            int      `json:"ssrc"`
+	SSRC            uint32   `json:"ssrc"`
 	IP              string   `json:"ip"`
 	Port            int      `json:"port"`
 	EncryptionModes []string `json:"modes"`
