@@ -7,13 +7,16 @@ import (
 	"fmt"
 	"go-bot/events"
 	"go-bot/gateway"
+	"io"
 	"log"
 	"net"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/crypto/nacl/secretbox"
 )
 
 // Client is used for interfacing with the voice api
@@ -26,6 +29,8 @@ type Client struct {
 	lastHeartbeatAck time.Time
 	currentChannelID string
 	UDPInfo          voiceReadyEvent
+	EncryptionMode   string
+	SecretKey        [32]byte
 }
 
 // NewClient retunres an initialized voice client
@@ -151,6 +156,17 @@ func (c *Client) start() {
 			go c.startHeartbeat(interval, stopc)
 		}
 
+		// session description
+		if p.Operation == 4 {
+			var desc sessionDescription
+			err := json.Unmarshal(p.EventData, &desc)
+			if err != nil {
+				log.Printf("error parsing description %v\n", err)
+			}
+			c.EncryptionMode = desc.Encryption
+			c.SecretKey = desc.SecretKey
+		}
+
 		if p.Operation == 3 {
 			c.lastHeartbeatAck = time.Now().UTC()
 			log.Println("Received Voice ACK")
@@ -174,21 +190,20 @@ func (c *Client) establishUDPConnection(UDPInfo voiceReadyEvent) error {
 	// 	return fmt.Errorf("error creating UDP address: %v", err)
 	// }
 
-	UDPConn, err := net.Dial("udp", addr)
+	conn, err := net.Dial("udp", addr)
 	if err != nil {
 		return fmt.Errorf("error establishing UDP connection: %v", err)
 	}
-	defer UDPConn.Close()
 
 	sendBuffer := make([]byte, 70)
 	binary.BigEndian.PutUint32(sendBuffer, UDPInfo.SSRC)
-	_, err = UDPConn.Write(sendBuffer)
+	_, err = conn.Write(sendBuffer)
 	if err != nil {
 		return fmt.Errorf("error starting IP discovery: %v", err)
 	}
 
 	readBuffer := make([]byte, 70)
-	_, err = UDPConn.Read(readBuffer)
+	_, err = conn.Read(readBuffer)
 	if err != nil {
 		return fmt.Errorf("error reading UDP response: %v", err)
 	}
@@ -218,6 +233,81 @@ func (c *Client) establishUDPConnection(UDPInfo voiceReadyEvent) error {
 
 	if err != nil {
 		return fmt.Errorf("error sending UDP communcation info: %v", err)
+	}
+
+	type voiceSpeakingData struct {
+		Speaking bool `json:"speaking"`
+		Delay    int  `json:"delay"`
+		SSRC     int  `json:"ssrc"`
+	}
+
+	type voiceSpeakingOp struct {
+		Op   int               `json:"op"` // Always 5
+		Data voiceSpeakingData `json:"d"`
+	}
+
+	c.wsMux.Lock()
+	c.conn.WriteJSON(voiceSpeakingOp{5, voiceSpeakingData{true, 0, int(c.UDPInfo.SSRC)}})
+	c.wsMux.Unlock()
+
+	timestamp := uint32(1)
+	sequnce := uint16(0)
+	RTPHeader := make([]byte, 12)
+
+	RTPHeader[0] = 0x80
+	RTPHeader[1] = 0x78
+	binary.BigEndian.PutUint32(RTPHeader[8:], c.UDPInfo.SSRC)
+
+	yID := "LDU_Txk06tM"
+	cmd := exec.Command("youtube-dl", "-o", "-", "-f 251", yID)
+
+	r, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Fatal(fmt.Errorf("error getting StdoutPipe: %v", err))
+	}
+
+	err = cmd.Start()
+	if err != nil {
+		log.Fatal(fmt.Errorf("error starting command: %v", err))
+	}
+
+	buf := make([]byte, 0, 4096)
+	for {
+		var nonce [24]byte
+
+		binary.BigEndian.PutUint16(RTPHeader[2:], sequnce)
+		binary.BigEndian.PutUint32(RTPHeader[4:], timestamp)
+
+		copy(nonce[:], RTPHeader)
+
+		// using buf[:cap(buf)] will make the slice use the whole underlying array of 4096 bytes
+		n, err := r.Read(buf[:cap(buf)])
+
+		// only use the read bytes of buf
+		// since the slice is between 0 and n the cap of buf will not change
+		buf = buf[:n]
+
+		// read will not return an error if n > 0
+		if n == 0 {
+			if err == nil {
+				// nothing happend
+				continue
+			}
+			if err == io.EOF {
+				break
+			}
+			log.Fatal(fmt.Errorf("error reading from stdout: %v", err))
+		}
+
+		sendbuf := secretbox.Seal(RTPHeader, buf, &nonce, &c.SecretKey)
+
+		nb, err := conn.Write(sendbuf)
+		if err != nil {
+			log.Printf("error sending to udp voice: %v\n", err)
+		}
+		sequnce++
+		timestamp += 960
+		log.Println("sent:", nb)
 	}
 
 	return nil
@@ -310,6 +400,14 @@ func logIfError(text string, err error) {
 	if err != nil {
 		log.Println(fmt.Errorf("%s %v", text, err))
 	}
+}
+
+type sessionDescription struct {
+	Encryption     string   `json:"mode"`
+	SecretKey      [32]byte `json:"secret_key"`
+	MediaSessionID string   `json:"media_session_id"`
+	VideoCodec     string   `json:"video_codec"`
+	AudioCodec     string   `json:"audio_codec"`
 }
 
 type communicationInfo struct {
