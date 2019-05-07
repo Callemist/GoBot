@@ -1,12 +1,10 @@
-package voice
+package main
 
 import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"go-bot/events"
-	"go-bot/gateway"
 	"io"
 	"log"
 	"net"
@@ -435,12 +433,12 @@ type voiceReadyEvent struct {
 	EncryptionModes []string `json:"modes"`
 }
 
-type helloEvent struct {
+type voiceHello struct {
 	// Use HeartbeatInterval * 0.75 to avoid Discord bug
 	HeartbeatInterval int `json:"heartbeat_interval"`
 }
 
-type heartbeat struct {
+type voiceHeartbeat struct {
 	Op    int `json:"op"`
 	Nonce int `json:"d"`
 }
