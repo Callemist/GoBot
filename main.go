@@ -23,7 +23,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	//voiceClient := voice.NewClient(wsClient)
+	voi := newVoice()
 
 	gw.eventHandlers[messageCreateEvent] = func(data json.RawMessage) {
 		var m message
@@ -39,7 +39,10 @@ func main() {
 
 		url := "https://discordapp.com/api/v6/channels/" + m.ChannelID + "/messages"
 
-		//go voiceClient.EstablishConnection("voice channel id")
+		err = voi.establishConnection("voice channel id", gw)
+		if err != nil {
+			log.Printf("error establishing voice connection: %v\n", err)
+		}
 
 		var jsonStr = []byte(`{"content":"Establishing voice", "tts": false}`)
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonStr))

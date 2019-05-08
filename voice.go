@@ -4,11 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -17,99 +16,150 @@ import (
 	"golang.org/x/crypto/nacl/secretbox"
 )
 
-// Client is used for interfacing with the voice api
-type Client struct {
-	gateway          *gateway.Client
-	serverInfo       events.VoiceServerUpdateEvent
-	userInfo         events.VoiceStateUpdateResponseEvent
+// voice is used for interfacing with Discords voice api
+type voice struct {
+	serverInfo       voiceServerUpdate
+	userInfo         voiceStateUpdateResponse
 	wsMux            sync.Mutex
 	conn             *websocket.Conn
 	lastHeartbeatAck time.Time
 	currentChannelID string
-	UDPInfo          voiceReadyEvent
-	EncryptionMode   string
-	SecretKey        [32]byte
+	udpInfo          voiceReady
+	encryptionMode   string
+	secretKey        [32]byte
+	udpConn          net.Conn
+	opusReceiver     chan []byte
+
+	// writing to this channel shutsdown the voice websocket
+	// and udp connection
+	exitc chan int
 }
 
-// NewClient retunres an initialized voice client
-func NewClient(g *gateway.Client) *Client {
-	c := Client{}
-	c.gateway = g
-	return &c
+func newVoice() *voice {
+	v := voice{}
+	v.exitc = make(chan int)
+	v.opusReceiver = make(chan []byte)
+	return &v
 }
 
-func (c *Client) EstablishConnection(channelID string) {
+func (v *voice) establishConnection(channelID string, gw *gateway) error {
 	// hardcoded to join try hard pvp channel
 	// TODO channelID should be picked from GUILDE state voice_states
 	// check if user_id exist in voice_states and join that channel
 	// wheh requested by text command
 	channelID = "220255406964998144"
+	v.currentChannelID = channelID
 
-	c.currentChannelID = channelID
-	c.gateway.RequestVoice(channelID)
+	respListener, err := gw.requestVoice(channelID)
+	if err != nil {
+		return fmt.Errorf("failed to request voice connection: %v", err)
+	}
 
+	// wait for the state and server update from the gateway
+	// will cause a deadlock if called from the same goroutine that
+	// the gateway open method runs in
 	for i := 0; i < 2; i++ {
-		p := <-c.gateway.VoiceUpdateResponse
-		if p.Type == events.VoiceStateUpdate {
-			var v events.VoiceStateUpdateResponseEvent
-			err := json.Unmarshal(p.EventData, &v)
+		p := <-respListener
+
+		if p.Type == voiceStateUpdateEvent {
+			var vstate voiceStateUpdateResponse
+			err := json.Unmarshal(p.EventData, &vstate)
 			if err != nil {
-				log.Println("could not unmarshal VoiceStateUpdateResponseEvent:", err)
+				return fmt.Errorf("could not unmarshal voiceStateUpdateResponse: %v", err)
 			}
-			c.userInfo = v
+			v.userInfo = vstate
 		}
 
-		if p.Type == events.VoiceServerUpdate {
-			var v events.VoiceServerUpdateEvent
-			err := json.Unmarshal(p.EventData, &v)
+		if p.Type == voiceServerUpdateEvent {
+			var vServer voiceServerUpdate
+			err := json.Unmarshal(p.EventData, &vServer)
 			if err != nil {
-				log.Println("could not unmarshal VoiceStateUpdateResponseEvent:", err)
+				return fmt.Errorf("could not unmarshal voiceServerUpdate: %v", err)
 			}
-			c.serverInfo = v
+			v.serverInfo = vServer
 		}
 	}
 
-	err := c.connectToVoiceWebsocket()
-	logIfError("", err)
+	err = v.connectToVoiceWebsocket()
+	if err != nil {
+		return fmt.Errorf("failed to establish voice websocket connection: %v", err)
+	}
 
-	err = c.identify()
-	logIfError("", err)
+	err = v.identify()
+	if err != nil {
+		return fmt.Errorf("error sending voice identification: %v", err)
+	}
 
-	c.start()
+	go v.open()
+	return nil
 }
 
-func (c *Client) connectToVoiceWebsocket() error {
-	URL := "wss://" + strings.TrimSuffix(c.serverInfo.Endpoint, ":80")
+func (v *voice) connectToVoiceWebsocket() error {
+	URL := "wss://" + strings.TrimSuffix(v.serverInfo.Endpoint, ":80")
 	conn, _, err := websocket.DefaultDialer.Dial(URL, nil)
 
 	if err != nil {
 		return fmt.Errorf("error creating voice websocket connection, %v", err)
 	}
 
-	c.conn = conn
+	v.conn = conn
 	return nil
 }
 
-func (c *Client) start() {
-	c.lastHeartbeatAck = time.Now().UTC()
-	stopc := make(chan int)
+func (v *voice) identify() error {
+	ide := voiceIdentification{
+		v.serverInfo.GuildID,
+		v.userInfo.UserID,
+		v.userInfo.SessionID,
+		v.serverInfo.Token}
+
+	jsonData, err := json.Marshal(ide)
+	if err != nil {
+		return fmt.Errorf("error parsing voice identification: %v", err)
+	}
+
+	v.wsMux.Lock()
+	err = v.conn.WriteJSON(simplePayload{0, jsonData})
+	v.wsMux.Unlock()
+
+	if err != nil {
+		return fmt.Errorf("error sending voice identification: %v", err)
+	}
+
+	return nil
+}
+
+func (v *voice) open() {
+	v.lastHeartbeatAck = time.Now().UTC()
+	stopHeart := make(chan int)
+	terminateUDPConnection := make(chan int)
 	var interval float32
 
 	for {
-		_, message, err := c.conn.ReadMessage()
+		select {
+		case <-v.exitc:
+			stopHeart <- 0
+			terminateUDPConnection <- 0
+			v.wsMux.Lock()
+			v.conn.Close()
+			v.wsMux.Unlock()
+			return
+		default:
+		}
+
+		_, message, err := v.conn.ReadMessage()
 		if err != nil {
 			log.Println(fmt.Errorf("error reading message: %v", err))
 			// This might cause problems so add back later
-
 			// log.Println("trying to re-establish connection")
-
 			// stopc <- 0
 			// c.wsMux.Lock()
 			// c.conn.Close()
 			// c.wsMux.Unlock()
 			// c.EstablishConnection(c.currentChannelID)
 
-			stopc <- 0
+			terminateUDPConnection <- 0
+			stopHeart <- 0
 			return
 		}
 
@@ -117,93 +167,118 @@ func (c *Client) start() {
 		json.Indent(&pretty, message, "", "    ")
 		log.Printf("voice received:\n%s\n", string(pretty.Bytes()))
 
-		var p events.Payload
+		var p payload
 		err = json.Unmarshal(message, &p)
-
 		if err != nil {
-			log.Println(fmt.Errorf("error parsing payload: %v", err))
-			return
+			log.Printf("error parsing payload: %v\n", err)
 		}
 
 		if p.Operation == 2 {
-			var ready voiceReadyEvent
+			var ready voiceReady
 			err := json.Unmarshal(p.EventData, &ready)
-
 			if err != nil {
-				log.Println(fmt.Errorf("error parsing ready event %v", err))
-				return
+				// TODO handle this better
+				log.Fatal(fmt.Errorf("error parsing ready event %v", err))
+			}
+			v.udpInfo = ready
+			err = v.establishUDPConnection()
+			if err != nil {
+				// TODO handle this better
+				log.Fatal(fmt.Errorf("error connecting to voice UDP %v", err))
 			}
 
-			c.UDPInfo = ready
-			err = c.establishUDPConnection(ready)
-			if err != nil {
-				log.Println(err)
-			}
 		}
 
 		if p.Operation == 8 {
-			var he helloEvent
+			var he voiceHello
 			err := json.Unmarshal(p.EventData, &he)
-
 			if err != nil {
-				log.Println(fmt.Errorf("error parsing hello event %v", err))
-				return
+				// TODO handle this better
+				log.Fatal(fmt.Errorf("error parsing hello event %v", err))
 			}
 
 			interval = float32(he.HeartbeatInterval) * 0.75
-			go c.startHeartbeat(interval, stopc)
+			go v.startHeart(interval, stopHeart)
 		}
 
 		// session description
 		if p.Operation == 4 {
-			var desc sessionDescription
-			err := json.Unmarshal(p.EventData, &desc)
+			var sd sessionDescription
+			err := json.Unmarshal(p.EventData, &sd)
 			if err != nil {
 				log.Printf("error parsing description %v\n", err)
 			}
-			c.EncryptionMode = desc.Encryption
-			c.SecretKey = desc.SecretKey
+			v.encryptionMode = sd.Encryption
+			v.secretKey = sd.SecretKey
+
+			go v.startOpusSender(terminateUDPConnection)
+
 		}
 
 		if p.Operation == 3 {
-			c.lastHeartbeatAck = time.Now().UTC()
-			log.Println("Received Voice ACK")
+			v.lastHeartbeatAck = time.Now().UTC()
+			log.Println("received voice ACK")
 		}
 
-		if time.Now().UTC().Sub(c.lastHeartbeatAck) > time.Millisecond*time.Duration(interval) {
-			stopc <- 0
-			c.reconnect()
+		if time.Now().UTC().Sub(v.lastHeartbeatAck) > time.Millisecond*time.Duration(interval) {
+			stopHeart <- 0
+			terminateUDPConnection <- 0
+			v.reconnect()
 			return
 		}
 	}
 }
 
-func (c *Client) establishUDPConnection(UDPInfo voiceReadyEvent) error {
-	log.Println("establishing UDP voice connection")
-	addr := fmt.Sprintf("%s:%d", UDPInfo.IP, UDPInfo.Port)
-	log.Println(addr)
+func (v *voice) startHeart(interval float32, stop chan int) {
+	log.Println("Voice Heart started")
 
-	// addr, err := net.ResolveUDPAddr("udp", UDPInfo.IP+":"+string(UDPInfo.Port))
-	// if err != nil {
-	// 	return fmt.Errorf("error creating UDP address: %v", err)
-	// }
+	ticker := time.NewTicker(time.Millisecond * time.Duration(interval))
+	defer ticker.Stop()
+	nonce := 1
+
+	for {
+		v.wsMux.Lock()
+		err := v.conn.WriteJSON(voiceHeartbeat{3, nonce})
+		v.wsMux.Unlock()
+
+		if err != nil {
+			log.Printf("error sending voice heartbeat: %v\n", err)
+		}
+
+		nonce++
+
+		select {
+		case <-ticker.C:
+		case <-stop:
+			return
+		}
+	}
+}
+
+func (v *voice) establishUDPConnection() error {
+	addr := fmt.Sprintf("%s:%d", v.udpInfo.IP, v.udpInfo.Port)
+	log.Printf("connecting to UDP address: %s\n", addr)
 
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
 		return fmt.Errorf("error establishing UDP connection: %v", err)
 	}
+	v.udpConn = conn
 
 	sendBuffer := make([]byte, 70)
-	binary.BigEndian.PutUint32(sendBuffer, UDPInfo.SSRC)
-	_, err = conn.Write(sendBuffer)
+	binary.BigEndian.PutUint32(sendBuffer, v.udpInfo.SSRC)
+	_, err = v.udpConn.Write(sendBuffer)
 	if err != nil {
 		return fmt.Errorf("error starting IP discovery: %v", err)
 	}
 
 	readBuffer := make([]byte, 70)
-	_, err = conn.Read(readBuffer)
+	n, err := v.udpConn.Read(readBuffer)
 	if err != nil {
 		return fmt.Errorf("error reading UDP response: %v", err)
+	}
+	if n < 70 {
+		return errors.New("IP discovery resposne needs to be 70 bytes")
 	}
 
 	var ip string
@@ -221,98 +296,69 @@ func (c *Client) establishUDPConnection(UDPInfo voiceReadyEvent) error {
 		return fmt.Errorf("error parsing communicationInfo: %v", err)
 	}
 
-	p := events.Payload{}
-	p.Operation = 1
-	p.EventData = jsonData
-
-	c.wsMux.Lock()
-	err = c.conn.WriteJSON(p)
-	c.wsMux.Unlock()
-
+	v.wsMux.Lock()
+	err = v.conn.WriteJSON(simplePayload{1, jsonData})
+	v.wsMux.Unlock()
 	if err != nil {
 		return fmt.Errorf("error sending UDP communcation info: %v", err)
-	}
-
-	type voiceSpeakingData struct {
-		Speaking bool `json:"speaking"`
-		Delay    int  `json:"delay"`
-		SSRC     int  `json:"ssrc"`
-	}
-
-	type voiceSpeakingOp struct {
-		Op   int               `json:"op"` // Always 5
-		Data voiceSpeakingData `json:"d"`
-	}
-
-	c.wsMux.Lock()
-	c.conn.WriteJSON(voiceSpeakingOp{5, voiceSpeakingData{true, 0, int(c.UDPInfo.SSRC)}})
-	c.wsMux.Unlock()
-
-	timestamp := uint32(1)
-	sequnce := uint16(0)
-	RTPHeader := make([]byte, 12)
-
-	RTPHeader[0] = 0x80
-	RTPHeader[1] = 0x78
-	binary.BigEndian.PutUint32(RTPHeader[8:], c.UDPInfo.SSRC)
-
-	yID := "LDU_Txk06tM"
-	cmd := exec.Command("youtube-dl", "-o", "-", "-f 251", yID)
-
-	r, err := cmd.StdoutPipe()
-	if err != nil {
-		log.Fatal(fmt.Errorf("error getting StdoutPipe: %v", err))
-	}
-
-	err = cmd.Start()
-	if err != nil {
-		log.Fatal(fmt.Errorf("error starting command: %v", err))
-	}
-
-	buf := make([]byte, 0, 4096)
-	for {
-		var nonce [24]byte
-
-		binary.BigEndian.PutUint16(RTPHeader[2:], sequnce)
-		binary.BigEndian.PutUint32(RTPHeader[4:], timestamp)
-
-		copy(nonce[:], RTPHeader)
-
-		// using buf[:cap(buf)] will make the slice use the whole underlying array of 4096 bytes
-		n, err := r.Read(buf[:cap(buf)])
-
-		// only use the read bytes of buf
-		// since the slice is between 0 and n the cap of buf will not change
-		buf = buf[:n]
-
-		// read will not return an error if n > 0
-		if n == 0 {
-			if err == nil {
-				// nothing happend
-				continue
-			}
-			if err == io.EOF {
-				break
-			}
-			log.Fatal(fmt.Errorf("error reading from stdout: %v", err))
-		}
-
-		sendbuf := secretbox.Seal(RTPHeader, buf, &nonce, &c.SecretKey)
-
-		nb, err := conn.Write(sendbuf)
-		if err != nil {
-			log.Printf("error sending to udp voice: %v\n", err)
-		}
-		sequnce++
-		timestamp += 960
-		log.Println("sent:", nb)
 	}
 
 	return nil
 }
 
-func (c *Client) reconnect() {
-	log.Println("Reconnecting to voice websocket")
+func (v *voice) sendOpusData(data []byte) {
+	v.opusReceiver <- data
+}
+
+func (v *voice) startOpusSender(terminate <-chan int) {
+	// this part of the header will stay the same for all packages
+	RTPHeader := make([]byte, 12)
+	RTPHeader[0] = 0x80
+	RTPHeader[1] = 0x78
+	binary.BigEndian.PutUint32(RTPHeader[8:], v.udpInfo.SSRC)
+
+	// https://loadmultiplier.com/content/rtp-timestamp-calculation
+	// send every 20 miliseconds = 50 sends per second
+	// Discord wants 48kHz audio
+	// timestam incrementation value = sampling rate / packets per second
+	// 48000 / 50 = 960
+	ticker := time.NewTicker(time.Millisecond * 20)
+	defer ticker.Stop()
+
+	var timestamp uint32
+	var sequnce uint16
+	var nonce [24]byte
+	var frame []byte
+
+	for {
+		select {
+		case frame = <-v.opusReceiver:
+		case <-terminate:
+			v.udpConn.Close()
+			return
+		}
+
+		binary.BigEndian.PutUint16(RTPHeader[2:], sequnce)
+		sequnce++
+
+		binary.BigEndian.PutUint32(RTPHeader[4:], timestamp)
+		timestamp += 960
+
+		copy(nonce[:], RTPHeader)
+
+		sendbuf := secretbox.Seal(RTPHeader, frame, &nonce, &v.secretKey)
+
+		<-ticker.C
+
+		_, err := v.udpConn.Write(sendbuf)
+		if err != nil {
+			log.Printf("error writing to UDP connection: %v\n", err)
+		}
+	}
+}
+
+func (v *voice) reconnect() {
+	log.Println("reconnecting to voice")
 
 	type resumeConnection struct {
 		ServerID  string `json:"server_id"`
@@ -320,78 +366,49 @@ func (c *Client) reconnect() {
 		Token     string `json:"token"`
 	}
 
-	r := resumeConnection{c.serverInfo.GuildID, c.userInfo.SessionID, c.serverInfo.Token}
-	jsonData, _ := json.Marshal(r)
+	v.wsMux.Lock()
+	v.conn.Close()
+	err := v.connectToVoiceWebsocket()
+	if err != nil {
+		// TODO handle better / log to discord text chat if possible
+		log.Printf("error recreating voice ws: %v", err)
+		return
+	}
 
-	p := events.Payload{}
-	p.Operation = 7
-	p.EventData = jsonData
+	rc := resumeConnection{v.serverInfo.GuildID, v.userInfo.SessionID, v.serverInfo.Token}
+	jsonData, _ := json.Marshal(rc)
 
-	c.wsMux.Lock()
-	c.conn.Close()
-	err := c.connectToVoiceWebsocket()
-	logIfError("error recreating voice ws:", err)
+	err = v.conn.WriteJSON(simplePayload{7, jsonData})
+	if err != nil {
+		// TODO handle better / log to discord text chat if possible
+		log.Printf("error sending resume voice payload: %v", err)
+		return
+	}
 
-	err = c.conn.WriteJSON(p)
-	logIfError("error sending resume event:", err)
-
-	c.wsMux.Unlock()
-
-	c.start()
+	v.wsMux.Unlock()
+	v.open()
 }
 
-func (c *Client) identify() error {
-	ide := identification{
-		c.serverInfo.GuildID,
-		c.userInfo.UserID,
-		c.userInfo.SessionID,
-		c.serverInfo.Token}
-
-	jsonData, err := json.Marshal(ide)
-
-	if err != nil {
-		return fmt.Errorf("error parsing voice identification: %v", err)
+func (v *voice) speaking(b bool) error {
+	type voiceSpeakingData struct {
+		Speaking bool `json:"speaking"`
+		Delay    int  `json:"delay"`
+		SSRC     int  `json:"ssrc"`
 	}
 
-	p := events.Payload{}
-	p.Operation = 0
-	p.EventData = jsonData
-
-	c.wsMux.Lock()
-	err = c.conn.WriteJSON(p)
-	c.wsMux.Unlock()
-
-	if err != nil {
-		return fmt.Errorf("error sending voice identification: %v", err)
+	type voiceSpeaking struct {
+		Op   int               `json:"op"` // Always 5
+		Data voiceSpeakingData `json:"d"`
 	}
 
+	v.wsMux.Lock()
+	err := v.conn.WriteJSON(voiceSpeaking{5, voiceSpeakingData{b, 0, int(v.udpInfo.SSRC)}})
+	v.wsMux.Unlock()
+
+	if err != nil {
+		return fmt.Errorf("failed to send speaking state: %v", err)
+	}
 	return nil
-}
-
-func (c *Client) startHeartbeat(interval float32, stop chan int) {
-	log.Println("Voice Heart started")
-
-	ticker := time.NewTicker(time.Millisecond * time.Duration(interval))
-	defer ticker.Stop()
-	nonce := 1
-
-	for {
-		c.wsMux.Lock()
-		err := c.conn.WriteJSON(heartbeat{3, nonce})
-		c.wsMux.Unlock()
-
-		if err != nil {
-			log.Printf("error sending voice heartbeat: %v\n", err)
-		}
-
-		nonce++
-
-		select {
-		case <-ticker.C:
-		case <-stop:
-			return
-		}
-	}
 }
 
 func logIfError(text string, err error) {
@@ -419,14 +436,14 @@ type data struct {
 	Encryption string `json:"mode"`
 }
 
-type identification struct {
+type voiceIdentification struct {
 	ServerID  string `json:"server_id"`
 	UserID    string `json:"user_id"`
 	SessionID string `json:"session_id"`
 	Token     string `json:"token"`
 }
 
-type voiceReadyEvent struct {
+type voiceReady struct {
 	SSRC            uint32   `json:"ssrc"`
 	IP              string   `json:"ip"`
 	Port            int      `json:"port"`

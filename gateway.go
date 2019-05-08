@@ -13,7 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Client handles communcation with Discords websocket api
+// gateway handles communcation with Discords websocket api
 type gateway struct {
 	token               string
 	wsMux               sync.Mutex
@@ -57,7 +57,7 @@ func (g *gateway) open() {
 	for {
 		_, message, err := g.conn.ReadMessage()
 		if err != nil {
-			log.Printf("error reading message: %v\n", err)
+			log.Printf("error reading gateway message: %v\n", err)
 		}
 
 		// var pretty bytes.Buffer
@@ -103,7 +103,7 @@ func (g *gateway) open() {
 			g.wsMux.Unlock()
 
 			if err != nil {
-				log.Printf("Error sending heartbeat on request of gateway: %s", err)
+				log.Printf("error sending heartbeat on request of gateway: %v\n", err)
 			}
 		}
 
@@ -130,7 +130,7 @@ func (g *gateway) handleEvent(p payload) {
 	}
 
 	if _, ok := g.eventHandlers[p.Type]; ok {
-		g.eventHandlers[p.Type](p.EventData)
+		go g.eventHandlers[p.Type](p.EventData)
 	}
 }
 
@@ -190,7 +190,8 @@ func (g *gateway) reconnect() {
 
 	conn, _, err := websocket.DefaultDialer.Dial(u, nil)
 	if err != nil {
-		log.Printf("failed to reconnect: %v\n", err)
+		log.Fatal(fmt.Sprintf("failed to reconnect: %v\n exiting..", err))
+		// would probably be good to terminate the voice connecion when this happens
 		return
 	}
 
@@ -203,7 +204,7 @@ func (g *gateway) reconnect() {
 // requestVoice sends a VoiceStateUpdate to the Discord voice server to
 // let it know that we want to connect, Discord should responed with
 // a VOICE_SERVER_UPDATE event and a VOICE_STATE_UPDATE event
-func (g *gateway) requestVoice(channelID string) error {
+func (g *gateway) requestVoice(channelID string) (chan payload, error) {
 	voiceState := voiceStateUpdate{
 		GuildID:   g.sessionInfo.UnavailableGuildes[0].GuildID,
 		ChannelID: channelID,
@@ -212,31 +213,31 @@ func (g *gateway) requestVoice(channelID string) error {
 
 	jsonData, err := json.Marshal(voiceState)
 	if err != nil {
-		return fmt.Errorf("error parsing voice state data: %v", err)
+		return nil, fmt.Errorf("error parsing voice state data: %v", err)
 	}
 
 	g.wsMux.Lock()
 	err = g.conn.WriteJSON(simplePayload{4, jsonData})
 	g.wsMux.Unlock()
 	if err != nil {
-		return fmt.Errorf("faild to send voice request: %v", err)
+		return nil, fmt.Errorf("failed to send voice request: %v", err)
 	}
 
 	log.Println("voice request sent")
-	return nil
+	return g.voiceUpdateResponse, nil
 }
 
 func getWsURL() (string, error) {
 	resp, err := http.Get("https://discordapp.com/api/gateway")
 	if err != nil {
-		return "", fmt.Errorf("faild to get websocket url: %v", err)
+		return "", fmt.Errorf("failed to get websocket url: %v", err)
 	}
 
 	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("faild to read wsURL response: %v", err)
+		return "", fmt.Errorf("failed to read wsURL response: %v", err)
 	}
 
 	var u wsURL
