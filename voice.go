@@ -330,6 +330,8 @@ func (v *voice) startOpusSender(terminate <-chan int) {
 	var nonce [24]byte
 	var frame []byte
 
+	v.speaking(true)
+
 	for {
 		select {
 		case frame = <-v.opusReceiver:
