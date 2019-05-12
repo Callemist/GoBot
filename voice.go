@@ -29,26 +29,26 @@ type voice struct {
 	secretKey        [32]byte
 	udpConn          net.Conn
 	opusReceiver     chan []byte
-
-	// writing to this channel shutsdown the voice websocket
-	// and udp connection
-	exitc chan int
+	setupMux         sync.Mutex
 }
 
 func newVoice() *voice {
 	v := voice{}
-	v.exitc = make(chan int)
 	v.opusReceiver = make(chan []byte)
 	return &v
 }
 
-func (v *voice) establishConnection(channelID string, gw *gateway) error {
+func (v *voice) joinVoice(channelID string, gw *gateway) error {
 	// hardcoded to join try hard pvp channel
 	// TODO channelID should be picked from GUILDE state voice_states
 	// check if user_id exist in voice_states and join that channel
 	// wheh requested by text command
 	channelID = "220255406964998144"
 	v.currentChannelID = channelID
+
+	// make sure that there are not multiple setups running simultaneously
+	v.setupMux.Lock()
+	defer v.setupMux.Unlock()
 
 	respListener, err := gw.requestVoice(channelID)
 	if err != nil {
@@ -59,13 +59,18 @@ func (v *voice) establishConnection(channelID string, gw *gateway) error {
 	// will cause a deadlock if called from the same goroutine that
 	// the gateway open method runs in
 	for i := 0; i < 2; i++ {
-		p := <-respListener
+		var p payload
+		select {
+		case p = <-respListener:
+		case <-time.After(time.Second * 5):
+			return fmt.Errorf("voice request response timedout")
+		}
 
 		if p.Type == voiceStateUpdateEvent {
 			var vstate voiceStateUpdateResponse
 			err := json.Unmarshal(p.EventData, &vstate)
 			if err != nil {
-				return fmt.Errorf("could not unmarshal voiceStateUpdateResponse: %v", err)
+				log.Printf("could not unmarshal voiceStateUpdateResponse: %v", err)
 			}
 			v.userInfo = vstate
 		}
@@ -74,7 +79,7 @@ func (v *voice) establishConnection(channelID string, gw *gateway) error {
 			var vServer voiceServerUpdate
 			err := json.Unmarshal(p.EventData, &vServer)
 			if err != nil {
-				return fmt.Errorf("could not unmarshal voiceServerUpdate: %v", err)
+				log.Printf("could not unmarshal voiceServerUpdate: %v", err)
 			}
 			v.serverInfo = vServer
 		}
@@ -136,29 +141,9 @@ func (v *voice) open() {
 	var interval float32
 
 	for {
-		select {
-		case <-v.exitc:
-			stopHeart <- 0
-			terminateUDPConnection <- 0
-			v.wsMux.Lock()
-			v.conn.Close()
-			v.wsMux.Unlock()
-			return
-		default:
-		}
-
 		_, message, err := v.conn.ReadMessage()
 		if err != nil {
 			log.Println(fmt.Errorf("error reading message: %v", err))
-			// This might cause problems so add back later
-			// log.Println("trying to re-establish connection")
-			// stopc <- 0
-			// c.wsMux.Lock()
-			// c.conn.Close()
-			// c.wsMux.Unlock()
-			// c.EstablishConnection(c.currentChannelID)
-
-			terminateUDPConnection <- 0
 			stopHeart <- 0
 			return
 		}
@@ -186,7 +171,6 @@ func (v *voice) open() {
 				// TODO handle this better
 				log.Fatal(fmt.Errorf("error connecting to voice UDP %v", err))
 			}
-
 		}
 
 		if p.Operation == 8 {
@@ -211,7 +195,7 @@ func (v *voice) open() {
 			v.encryptionMode = sd.Encryption
 			v.secretKey = sd.SecretKey
 
-			go v.startOpusSender(terminateUDPConnection)
+			go v.startOpusSender()
 
 		}
 
@@ -310,7 +294,7 @@ func (v *voice) sendOpusData(data []byte) {
 	v.opusReceiver <- data
 }
 
-func (v *voice) startOpusSender(terminate <-chan int) {
+func (v *voice) startOpusSender() {
 	// this part of the header will stay the same for all packages
 	RTPHeader := make([]byte, 12)
 	RTPHeader[0] = 0x80

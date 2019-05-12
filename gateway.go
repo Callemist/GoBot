@@ -32,7 +32,7 @@ func newGateway(t string) (*gateway, error) {
 		token:               t,
 		sequence:            new(int64),
 		eventHandlers:       make(map[string]func(json.RawMessage)),
-		voiceUpdateResponse: make(chan payload, 2)}
+		voiceUpdateResponse: make(chan payload)}
 
 	u, err := getWsURL()
 	if err != nil {
@@ -126,7 +126,16 @@ func (g *gateway) handleEvent(p payload) {
 	}
 
 	if p.Type == voiceStateUpdateEvent || p.Type == voiceServerUpdateEvent {
-		g.voiceUpdateResponse <- p
+		// if it takes more than 5 seconds for this response to arrive the voice request loop
+		// will have timed out, if a new loop have not been started no read will be made on this
+		// channel, this will both avoid blocking and discard the response if there is no reader.
+		go func() {
+			select {
+			case g.voiceUpdateResponse <- p:
+			case <-time.After(time.Millisecond * 300):
+			}
+		}()
+
 	}
 
 	if _, ok := g.eventHandlers[p.Type]; ok {
