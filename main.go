@@ -37,8 +37,18 @@ func main() {
 			return
 		}
 
-		if m.Content != "!s" {
+		if m.Content != "!s" && m.Content != "!e" {
 			return
+		}
+
+		var cID string
+		if m.Content == "!s" {
+			cID = "327232994102214656"
+		}
+
+		if m.Content == "!e" {
+			voi.speaking(false)
+			cID = "220255406964998144"
 		}
 
 		const (
@@ -56,11 +66,25 @@ func main() {
 
 		// ####### download video as webm #######
 
-		err = voi.establishConnection("voice channel id", gw)
+		connected, err := voi.establishConnection(cID, gw)
 		if err != nil {
 			log.Printf("error establishing voice connection: %v\n", err)
 			return
 		}
+
+		err = <-connected
+		if err != nil {
+			log.Printf("error establishing voice connection: %v\n", err)
+		}
+
+		go func() {
+			err := <-connected
+			if err != nil {
+				log.Printf("voice connection error: %v\n", err)
+			}
+		}()
+
+		voi.speaking(true)
 
 		yID := "8-kcWrCX9rA" // 1:58 long
 		filename := yID + ".webm"

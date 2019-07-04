@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -60,9 +61,9 @@ func (g *gateway) open() {
 			log.Printf("error reading gateway message: %v\n", err)
 		}
 
-		// var pretty bytes.Buffer
-		// json.Indent(&pretty, message, "", "    ")
-		// log.Printf("received:\n%s\n", string(pretty.Bytes()))
+		var pretty bytes.Buffer
+		json.Indent(&pretty, message, "", "    ")
+		log.Printf("received:\n%s\n", string(pretty.Bytes()))
 
 		var p payload
 		err = json.Unmarshal(message, &p)
@@ -126,16 +127,7 @@ func (g *gateway) handleEvent(p payload) {
 	}
 
 	if p.Type == voiceStateUpdateEvent || p.Type == voiceServerUpdateEvent {
-		// if it takes more than 5 seconds for this response to arrive the voice request loop
-		// will have timed out, if a new loop have not been started no read will be made on this
-		// channel, this will both avoid blocking and discard the response if there is no reader.
-		go func() {
-			select {
-			case g.voiceUpdateResponse <- p:
-			case <-time.After(time.Millisecond * 300):
-			}
-		}()
-
+		g.voiceUpdateResponse <- p
 	}
 
 	if _, ok := g.eventHandlers[p.Type]; ok {
@@ -213,7 +205,7 @@ func (g *gateway) reconnect() {
 // requestVoice sends a VoiceStateUpdate to the Discord voice server to
 // let it know that we want to connect, Discord should responed with
 // a VOICE_SERVER_UPDATE event and a VOICE_STATE_UPDATE event
-func (g *gateway) requestVoice(channelID string) (chan payload, error) {
+func (g *gateway) requestVoice(channelID string) error {
 	voiceState := voiceStateUpdate{
 		GuildID:   g.sessionInfo.UnavailableGuildes[0].GuildID,
 		ChannelID: channelID,
@@ -222,18 +214,18 @@ func (g *gateway) requestVoice(channelID string) (chan payload, error) {
 
 	jsonData, err := json.Marshal(voiceState)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing voice state data: %v", err)
+		return fmt.Errorf("error parsing voice state data: %v", err)
 	}
 
 	g.wsMux.Lock()
 	err = g.conn.WriteJSON(simplePayload{4, jsonData})
 	g.wsMux.Unlock()
 	if err != nil {
-		return nil, fmt.Errorf("failed to send voice request: %v", err)
+		return fmt.Errorf("failed to send voice request: %v", err)
 	}
 
 	log.Println("voice request sent")
-	return g.voiceUpdateResponse, nil
+	return nil
 }
 
 func getWsURL() (string, error) {

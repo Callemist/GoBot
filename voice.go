@@ -18,85 +18,98 @@ import (
 
 // voice is used for interfacing with Discords voice api
 type voice struct {
-	serverInfo       voiceServerUpdate
-	userInfo         voiceStateUpdateResponse
-	wsMux            sync.Mutex
-	conn             *websocket.Conn
-	lastHeartbeatAck time.Time
-	currentChannelID string
-	udpInfo          voiceReady
-	encryptionMode   string
-	secretKey        [32]byte
-	udpConn          net.Conn
-	opusReceiver     chan []byte
-	setupMux         sync.Mutex
+	serverInfo          voiceServerUpdate
+	userInfo            voiceStateUpdateResponse
+	wsMux               sync.Mutex
+	conn                *websocket.Conn
+	lastHeartbeatAck    time.Time
+	currentChannelID    string
+	udpInfo             voiceReady
+	encryptionMode      string
+	secretKey           [32]byte
+	udpConn             net.Conn
+	opusReceiver        chan []byte
+	connected           chan error
+	firstConnectionMade bool
+	running             bool
 }
 
 func newVoice() *voice {
 	v := voice{}
+	v.connected = make(chan error)
 	v.opusReceiver = make(chan []byte)
 	return &v
 }
 
-func (v *voice) joinVoice(channelID string, gw *gateway) error {
-	// hardcoded to join try hard pvp channel
+// func (v *voice) inChannel(channelID string) bool {
+// 	//TODO check if bot is in voice channel
+// }
+
+func (v *voice) establishConnection(channelID string, gw *gateway) (chan error, error) {
 	// TODO channelID should be picked from GUILDE state voice_states
 	// check if user_id exist in voice_states and join that channel
 	// wheh requested by text command
-	channelID = "220255406964998144"
-	v.currentChannelID = channelID
 
-	// make sure that there are not multiple setups running simultaneously
-	v.setupMux.Lock()
-	defer v.setupMux.Unlock()
-
-	respListener, err := gw.requestVoice(channelID)
-	if err != nil {
-		return fmt.Errorf("failed to request voice connection: %v", err)
+	if v.running {
+		v.wsMux.Lock()
+		v.conn.Close()
+		v.wsMux.Unlock()
 	}
 
-	// wait for the state and server update from the gateway
-	// will cause a deadlock if called from the same goroutine that
-	// the gateway open method runs in
-	for i := 0; i < 2; i++ {
+	v.currentChannelID = channelID
+
+	// if a server connection is already made only wait for the voiceStateUpdateEvent
+	var eventCount int
+	if v.firstConnectionMade {
+		eventCount = 1
+	} else {
+		eventCount = 2
+	}
+
+	go func() {
+		err := gw.requestVoice(channelID)
+		if err != nil {
+			log.Printf("failed to request voice connection: %v\n", err)
+		}
+	}()
+
+	// wait for the gateway event(s)
+	for i := 0; i < eventCount; i++ {
 		var p payload
 		select {
-		case p = <-respListener:
+		case p = <-gw.voiceUpdateResponse:
 		case <-time.After(time.Second * 5):
-			return fmt.Errorf("voice request response timedout")
+			return nil, fmt.Errorf("voice request response timedout")
 		}
 
 		if p.Type == voiceStateUpdateEvent {
 			var vstate voiceStateUpdateResponse
 			err := json.Unmarshal(p.EventData, &vstate)
-			if err != nil {
-				log.Printf("could not unmarshal voiceStateUpdateResponse: %v", err)
-			}
+			handleJSONError("could not unmarshal voiceStateUpdateResponse", err)
 			v.userInfo = vstate
 		}
 
 		if p.Type == voiceServerUpdateEvent {
 			var vServer voiceServerUpdate
 			err := json.Unmarshal(p.EventData, &vServer)
-			if err != nil {
-				log.Printf("could not unmarshal voiceServerUpdate: %v", err)
-			}
+			handleJSONError("could not unmarshal voiceServerUpdate", err)
+			v.firstConnectionMade = true
 			v.serverInfo = vServer
 		}
 	}
 
-	err = v.connectToVoiceWebsocket()
+	err := v.connectToVoiceWebsocket()
 	if err != nil {
-		return fmt.Errorf("failed to establish voice websocket connection: %v", err)
+		return nil, fmt.Errorf("failed to establish voice websocket connection: %v", err)
 	}
 
 	err = v.identify()
 	if err != nil {
-		return fmt.Errorf("error sending voice identification: %v", err)
+		return nil, fmt.Errorf("error sending voice identification: %v", err)
 	}
 
 	go v.open()
-	return nil
+	return v.connected, nil
 }
 
 func (v *voice) connectToVoiceWebsocket() error {
@@ -136,15 +149,22 @@ func (v *voice) identify() error {
 
 func (v *voice) open() {
 	v.lastHeartbeatAck = time.Now().UTC()
-	stopHeart := make(chan int)
-	terminateUDPConnection := make(chan int)
+	var stopHeart chan int
 	var interval float32
 
 	for {
 		_, message, err := v.conn.ReadMessage()
 		if err != nil {
-			log.Println(fmt.Errorf("error reading message: %v", err))
-			stopHeart <- 0
+			// TODO chekc if the error is caused by a connection close and do not log
+			// an error in that case.
+			if stopHeart != nil {
+				stopHeart <- 0
+			}
+			if v.udpConn != nil {
+				v.udpConn.Close()
+			}
+			v.running = false
+			v.connected <- fmt.Errorf("error reading voice ws message: %v", err)
 			return
 		}
 
@@ -154,34 +174,30 @@ func (v *voice) open() {
 
 		var p payload
 		err = json.Unmarshal(message, &p)
-		if err != nil {
-			log.Printf("error parsing payload: %v\n", err)
-		}
+		handleJSONError("error parsing payload", err)
 
 		if p.Operation == 2 {
 			var ready voiceReady
 			err := json.Unmarshal(p.EventData, &ready)
-			if err != nil {
-				// TODO handle this better
-				log.Fatal(fmt.Errorf("error parsing ready event %v", err))
-			}
+			handleJSONError("error parsing ready event", err)
+
 			v.udpInfo = ready
 			err = v.establishUDPConnection()
 			if err != nil {
-				// TODO handle this better
-				log.Fatal(fmt.Errorf("error connecting to voice UDP %v", err))
+				stopHeart <- 0
+				v.running = false
+				v.connected <- fmt.Errorf("error connecting to voice UDP %v", err)
+				return
 			}
 		}
 
 		if p.Operation == 8 {
 			var he voiceHello
 			err := json.Unmarshal(p.EventData, &he)
-			if err != nil {
-				// TODO handle this better
-				log.Fatal(fmt.Errorf("error parsing hello event %v", err))
-			}
+			handleJSONError("error parsing hello event", err)
 
 			interval = float32(he.HeartbeatInterval) * 0.75
+			stopHeart = make(chan int)
 			go v.startHeart(interval, stopHeart)
 		}
 
@@ -189,14 +205,12 @@ func (v *voice) open() {
 		if p.Operation == 4 {
 			var sd sessionDescription
 			err := json.Unmarshal(p.EventData, &sd)
-			if err != nil {
-				log.Printf("error parsing description %v\n", err)
-			}
+			handleJSONError("error parsing description", err)
+
 			v.encryptionMode = sd.Encryption
 			v.secretKey = sd.SecretKey
 
 			go v.startOpusSender()
-
 		}
 
 		if p.Operation == 3 {
@@ -206,7 +220,6 @@ func (v *voice) open() {
 
 		if time.Now().UTC().Sub(v.lastHeartbeatAck) > time.Millisecond*time.Duration(interval) {
 			stopHeart <- 0
-			terminateUDPConnection <- 0
 			v.reconnect()
 			return
 		}
@@ -234,6 +247,7 @@ func (v *voice) startHeart(interval float32, stop chan int) {
 		select {
 		case <-ticker.C:
 		case <-stop:
+			log.Println("heart received stop signal")
 			return
 		}
 	}
@@ -314,15 +328,11 @@ func (v *voice) startOpusSender() {
 	var nonce [24]byte
 	var frame []byte
 
-	v.speaking(true)
+	v.running = true
+	v.connected <- nil
 
 	for {
-		select {
-		case frame = <-v.opusReceiver:
-		case <-terminate:
-			v.udpConn.Close()
-			return
-		}
+		frame = <-v.opusReceiver
 
 		binary.BigEndian.PutUint16(RTPHeader[2:], sequnce)
 		sequnce++
@@ -338,7 +348,11 @@ func (v *voice) startOpusSender() {
 
 		_, err := v.udpConn.Write(sendbuf)
 		if err != nil {
+			// this will most likey be caused by a close call on the udp connection
+			// TODO chekc if the error is caused by a connection close and do not log
+			// an error in that case.
 			log.Printf("error writing to UDP connection: %v\n", err)
+			return
 		}
 	}
 }
@@ -352,12 +366,16 @@ func (v *voice) reconnect() {
 		Token     string `json:"token"`
 	}
 
+	if v.udpConn != nil {
+		v.udpConn.Close()
+	}
+
 	v.wsMux.Lock()
 	v.conn.Close()
 	err := v.connectToVoiceWebsocket()
 	if err != nil {
-		// TODO handle better / log to discord text chat if possible
-		log.Printf("error recreating voice ws: %v", err)
+		v.running = false
+		v.connected <- fmt.Errorf("error recreating voice ws: %v", err)
 		return
 	}
 
@@ -366,8 +384,8 @@ func (v *voice) reconnect() {
 
 	err = v.conn.WriteJSON(simplePayload{7, jsonData})
 	if err != nil {
-		// TODO handle better / log to discord text chat if possible
-		log.Printf("error sending resume voice payload: %v", err)
+		v.running = false
+		v.connected <- fmt.Errorf("error sending resume voice payload: %v", err)
 		return
 	}
 
@@ -397,9 +415,9 @@ func (v *voice) speaking(b bool) error {
 	return nil
 }
 
-func logIfError(text string, err error) {
+func handleJSONError(description string, err error) {
 	if err != nil {
-		log.Println(fmt.Errorf("%s %v", text, err))
+		log.Printf("%s %v\n", description, err)
 	}
 }
 
